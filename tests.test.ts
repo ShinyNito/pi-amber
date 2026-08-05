@@ -1,0 +1,364 @@
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
+import type { Message } from "@earendil-works/pi-ai";
+import { estimateTextTokenUnits, estimateTextTokens } from "./tokenLedger.ts";
+import { detectSummaryLanguage } from "./summaryLanguage.ts";
+import {
+  parseCompactionSummaryXml,
+  validateCompactionSummary,
+  buildVerificationSignals,
+  formatSummaryForContext,
+} from "./validate.ts";
+import {
+  serializeForSummary,
+  estimateSummaryInputTokens,
+  type SummarizeInput,
+} from "./summarizer.ts";
+import {
+  createCompactionPressure,
+  normalizePressure,
+  notePressureAfterCompaction,
+  PRESSURE_DECAY_WINDOW_MS,
+} from "./pressure.ts";
+
+// ---------------------------------------------------------------------------
+// tokenLedger (plain-text estimation, used by validation)
+// ---------------------------------------------------------------------------
+
+describe("tokenLedger", () => {
+  test("estimates latin text at ~chars/4", () => {
+    const text = "hello world this is a test message";
+    const units = estimateTextTokenUnits(text);
+    assert.ok(units > 0);
+    assert.ok(units <= text.length);
+    assert.ok(Math.abs(units - 8) < 2, `expected ~8 tokens, got ${units}`);
+  });
+
+  test("counts CJK denser than latin", () => {
+    const cjk = "你好世界，这是一个测试消息".repeat(10);
+    const latin = "a".repeat(cjk.length);
+    assert.ok(estimateTextTokenUnits(cjk) > estimateTextTokenUnits(latin) * 2);
+  });
+
+  test("estimate is additive across splits", () => {
+    const a = "hello 世界 " + "x".repeat(50);
+    const b = "more text 测试 " + "y".repeat(30);
+    assert.equal(estimateTextTokenUnits(a + b), estimateTextTokenUnits(a) + estimateTextTokenUnits(b));
+  });
+
+  test("empty text → 0", () => {
+    assert.equal(estimateTextTokens("   "), 0);
+    assert.equal(estimateTextTokenUnits(""), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// summaryLanguage
+// ---------------------------------------------------------------------------
+
+function userMsg(content: string): Message {
+  return { role: "user", content, timestamp: Date.now() } as Message;
+}
+
+describe("summaryLanguage", () => {
+  test("detects chinese from CJK-dominant messages", () => {
+    assert.equal(
+      detectSummaryLanguage([
+        userMsg("帮我重构这个模块，注意保持向后兼容。"),
+        userMsg("顺便加个测试。"),
+      ]),
+      "Chinese",
+    );
+  });
+
+  test("returns undefined for latin-dominant", () => {
+    assert.equal(
+      detectSummaryLanguage([userMsg("Please refactor this module.")]),
+      undefined,
+    );
+  });
+
+  test("returns undefined for too little sample", () => {
+    assert.equal(detectSummaryLanguage([userMsg("好")]), undefined);
+  });
+
+  test("detects japanese when kana present", () => {
+    assert.equal(
+      detectSummaryLanguage([userMsg("このモジュールをリファクタリングしてください。")]),
+      "Japanese",
+    );
+  });
+
+  test("detects korean when hangul dominant", () => {
+    assert.equal(
+      detectSummaryLanguage([userMsg("이 모듈을 리팩토링하고 테스트도 추가해 주세요.")]),
+      "Korean",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validate
+// ---------------------------------------------------------------------------
+
+describe("validate", () => {
+  const validXml = `<summary>
+<task>Refactor the auth module</task>
+<constraints>
+- keep backward compatibility
+</constraints>
+<state>Mostly done, tests pending</state>
+<artifacts>
+- [file] src/auth.ts | modified
+- [file] src/auth.test.ts | created
+</artifacts>
+<decisions>
+- use JWT — user requirement
+</decisions>
+<dead_ends>
+- tried bcrypt — too slow
+</dead_ends>
+<knowledge>
+- pnpm workspaces need hoisting
+</knowledge>
+<open_loops>
+- confirm token expiry policy
+</open_loops>
+<next_steps>
+1. write tests
+2. run pnpm test
+</next_steps>
+<breadcrumbs>
+- src/auth.ts
+</breadcrumbs>
+</summary>`;
+
+  test("parses summary xml into sections", () => {
+    const parsed = parseCompactionSummaryXml(validXml);
+    assert.equal(parsed.task, "Refactor the auth module");
+    assert.match(parsed.artifacts, /src\/auth\.ts/);
+    assert.match(parsed.next_steps, /write tests/);
+  });
+
+  test("strips code fences", () => {
+    const fenced = "```xml\n" + validXml + "\n```";
+    assert.equal(parseCompactionSummaryXml(fenced).task, "Refactor the auth module");
+  });
+
+  test("valid summary passes validation", () => {
+    const text = validateCompactionSummary(validXml, 1000, []);
+    assert.match(text, /## Task/);
+    assert.match(text, /## Next Steps/);
+  });
+
+  test("missing required tags fails validation", () => {
+    assert.throws(
+      () => validateCompactionSummary("<summary><task>x</task></summary>", 1000, []),
+      /missing <state>/,
+    );
+  });
+
+  test("missing technical refs fails when signals required", () => {
+    const signals = ["src/auth.ts", "pnpm test"];
+    const summaryWithoutRefs = `<summary>
+<task>Fix a bug</task>
+<state>Done</state>
+<next_steps>1. ship it</next_steps>
+<artifacts>
+- [file] something/else.ts | modified
+</artifacts>
+</summary>`;
+    assert.throws(
+      () => validateCompactionSummary(summaryWithoutRefs, 1000, signals),
+      /verification pass missing recent technical refs/,
+    );
+  });
+
+  test("summary containing refs passes signal check", () => {
+    const text = validateCompactionSummary(validXml, 1000, ["src/auth.ts"]);
+    assert.match(text, /## Task/);
+  });
+
+  test("too-short summary rejected on large source", () => {
+    assert.throws(
+      () =>
+        validateCompactionSummary(
+          "<summary><task>t</task><state>s</state><next_steps>1</next_steps><artifacts>- [file] a.ts | read</artifacts></summary>",
+          5000,
+          [],
+        ),
+      /summary too short/,
+    );
+  });
+
+  test("buildVerificationSignals extracts paths and commands", () => {
+    const signals = buildVerificationSignals([
+      { content: "check src/lib/utils.ts and run pnpm test" },
+      { text: "modified config.json" },
+      { toolCalls: ['read path="src/main.ts"'] },
+    ]);
+    assert.ok(signals.length > 0);
+    assert.ok(signals.some((s) => s.includes("utils.ts")));
+  });
+
+  test("formatSummaryForContext renders markdown", () => {
+    const parsed = parseCompactionSummaryXml(validXml);
+    const text = formatSummaryForContext(parsed);
+    assert.match(text, /## Constraints/);
+    assert.match(text, /## Dead Ends/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// summarizer: official serializer integration
+// ---------------------------------------------------------------------------
+
+describe("summarizer", () => {
+  function makeMessages(count: number): Message[] {
+    const messages: Message[] = [];
+    for (let i = 0; i < count; i += 1) {
+      if (i % 3 === 0) {
+        messages.push({
+          role: "user",
+          content: `user message ${i} — 中文内容测试`,
+          timestamp: Date.now() + i,
+        } as Message);
+      } else if (i % 3 === 1) {
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: `assistant reply ${i}` }],
+          timestamp: Date.now() + i,
+        } as Message);
+      } else {
+        messages.push({
+          role: "toolResult",
+          toolCallId: `call-${i}`,
+          toolName: "read",
+          isError: false,
+          content: [{ type: "text", text: `output ${i}` + "x".repeat(100) }],
+          timestamp: Date.now() + i,
+        } as Message);
+      }
+    }
+    return messages;
+  }
+
+  test("serializeForSummary uses pi's serializer format", () => {
+    const input: SummarizeInput = {
+      messages: makeMessages(3),
+    };
+    const text = serializeForSummary(input);
+    assert.match(text, /\[User\]: user message 0/);
+    assert.match(text, /\[Assistant\]: assistant reply 1/);
+    assert.match(text, /\[Tool result\]:/);
+  });
+
+  test("serializeForSummary includes previous summary and next message", () => {
+    const text = serializeForSummary({
+      messages: makeMessages(1),
+      previousSummary: "previous context",
+      nextUserMessage: "next instruction",
+    });
+    assert.match(text, /<previous-summary>/);
+    assert.match(text, /previous context/);
+    assert.match(text, /<next-user-message>/);
+    assert.match(text, /next instruction/);
+  });
+
+  test("estimateSummaryInputTokens is positive and grows with input", () => {
+    const small = estimateSummaryInputTokens({ messages: makeMessages(3) });
+    const large = estimateSummaryInputTokens({ messages: makeMessages(30) });
+    assert.ok(small > 0);
+    assert.ok(large > small);
+  });
+
+  test("estimateSummaryInputTokens includes previous summary", () => {
+    const base = estimateSummaryInputTokens({ messages: makeMessages(3) });
+    const withPrev = estimateSummaryInputTokens({
+      messages: makeMessages(3),
+      previousSummary: "x".repeat(400),
+    });
+    assert.ok(withPrev > base);
+  });
+
+  test("convertToLlm round-trips agent messages", () => {
+    const llm = convertToLlm(makeMessages(3));
+    assert.equal(llm.length, 3);
+    assert.deepEqual(
+      llm.map((m) => m.role),
+      ["user", "assistant", "toolResult"],
+    );
+  });
+
+  test("serializeForSummary includes deterministic file ops", () => {
+    const text = serializeForSummary({
+      messages: makeMessages(1),
+      fileOps: {
+        read: new Set(["src/a.ts", "src/b.ts"]),
+        written: new Set(["out/result.json"]),
+        edited: new Set(["src/a.ts"]),
+      },
+    });
+    assert.match(text, /<read-files>/);
+    assert.match(text, /src\/a\.ts/);
+    assert.match(text, /<written-files>/);
+    assert.match(text, /<edited-files>/);
+  });
+
+  test("serializeForSummary omits empty file ops", () => {
+    const text = serializeForSummary({
+      messages: makeMessages(1),
+      fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+    });
+    assert.doesNotMatch(text, /<read-files>/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pressure (escalation ladder)
+// ---------------------------------------------------------------------------
+
+describe("pressure", () => {
+  test("starts at level 0", () => {
+    const p = createCompactionPressure();
+    assert.equal(p.level, 0);
+    assert.equal(p.consecutiveIneffective, 0);
+  });
+
+  test("ineffective compaction raises level", () => {
+    let p = createCompactionPressure();
+    p = notePressureAfterCompaction(p, { effective: false, now: 1000 });
+    assert.equal(p.level, 1);
+    assert.equal(p.consecutiveIneffective, 1);
+    p = notePressureAfterCompaction(p, { effective: false, now: 2000 });
+    assert.equal(p.level, 2);
+    // level 2 is the cap
+    p = notePressureAfterCompaction(p, { effective: false, now: 3000 });
+    assert.equal(p.level, 2);
+  });
+
+  test("effective compaction resets streak", () => {
+    let p = createCompactionPressure();
+    p = notePressureAfterCompaction(p, { effective: false, now: 1000 });
+    p = notePressureAfterCompaction(p, { effective: true, now: 2000 });
+    assert.equal(p.level, 0);
+    assert.equal(p.consecutiveIneffective, 0);
+  });
+
+  test("pressure decays after idle window", () => {
+    let p = createCompactionPressure();
+    p = notePressureAfterCompaction(p, { effective: false, now: 1000 });
+    const now = 1000 + PRESSURE_DECAY_WINDOW_MS + 1;
+    const normalized = normalizePressure(p, now);
+    assert.equal(normalized.level, 0);
+    assert.equal(normalized.consecutiveIneffective, 0);
+  });
+
+  test("fresh pressure is not decayed", () => {
+    let p = createCompactionPressure();
+    p = notePressureAfterCompaction(p, { effective: false, now: 1000 });
+    const normalized = normalizePressure(p, 1000 + PRESSURE_DECAY_WINDOW_MS - 1);
+    assert.equal(normalized.level, 1);
+  });
+});

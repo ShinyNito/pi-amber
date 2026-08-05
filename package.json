@@ -1,0 +1,55 @@
+{
+  "name": "@shinynito/pi-amber",
+  "version": "0.1.0",
+  "description": "pi extension: context compaction with structured summaries, validation, and self-repair",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "compaction",
+    "summarization",
+    "context"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShinyNito/pi-amber.git"
+  },
+  "files": [
+    "index.ts",
+    "policy.ts",
+    "summarizer.ts",
+    "validate.ts",
+    "tokenLedger.ts",
+    "summaryLanguage.ts",
+    "config.ts",
+    "pressure.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
