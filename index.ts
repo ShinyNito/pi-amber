@@ -100,71 +100,81 @@ export default function amber(pi: ExtensionAPI) {
   // (the session_before_compact event does not carry it).
   let cachedSystemPrompt = "";
 
+  pi.on("session_start", (event, ctx) => {
+    ctx.ui.notify("🟠 pi-amber loaded — ready to compact", "info");
+  });
+
   pi.on("before_agent_start", (event) => {
     cachedSystemPrompt = event.systemPrompt;
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
-    const config = loadConfig();
-    if (!config.enabled) return;
-
+    // The entire handler is guarded: any unexpected error falls back to pi's
+    // default compaction with a visible notice instead of silently dying.
     const { preparation, branchEntries, signal } = event;
-    const {
-      messagesToSummarize,
-      turnPrefixMessages,
-      firstKeptEntryId,
-      tokensBefore,
-      previousSummary,
-    } = preparation;
-
-    const allMessages = convertToLlm([...messagesToSummarize, ...turnPrefixMessages]);
-    if (allMessages.length === 0) {
-      return; // nothing to summarize → default behavior
-    }
-
-    const model = resolveSummaryModel(ctx, config);
-    if (!model) {
-      ctx.ui.notify("pi-amber: no summarization model available, using default compaction", "warning");
-      return;
-    }
-
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok) {
-      ctx.ui.notify(`pi-amber: auth failed (${auth.error}), using default compaction`, "warning");
-      return;
-    }
-    const summaryAuth: SummaryAuth = {
-      apiKey: auth.apiKey,
-      headers: auth.headers,
-      env: auth.env,
-    };
-
-    // Iterative context: reuse the previous summary (from the event or the branch).
-    const prevCompaction = lastCompactionFromBranch(branchEntries);
-    const previousSummarySource = previousSummary || prevCompaction?.summary;
-
-    // Escalation ladder: read the persisted pressure from the previous
-    // compaction, let it decay if stale, then decide how aggressive to be.
-    const prevDetails = prevCompaction?.details as AmberCompactionDetails | undefined;
-    const now = Date.now();
-    const pressure = normalizePressure(
-      prevDetails?.pressure ?? createCompactionPressure(),
-      now,
-    );
-    const escalate = pressure.level >= 1;
-
-    const summaryLanguage = detectSummaryLanguage(allMessages);
-
-    // --- UI: running phase ---
-    ctx.ui.setStatus(
-      STATUS_KEY,
-      `🟠 compacting ${allMessages.length} msgs · ${tokensBefore.toLocaleString()} tokens`,
-    );
-    ctx.ui.setWorkingMessage(
-      escalate ? `🟠 amber: compacting (level ${pressure.level})…` : "🟠 amber: compacting…",
-    );
-
     try {
+      const config = loadConfig();
+      if (!config.enabled) {
+        ctx.ui.notify("🟠 pi-amber: disabled in config, using pi default", "warning");
+        return;
+      }
+
+      const {
+        messagesToSummarize,
+        turnPrefixMessages,
+        firstKeptEntryId,
+        tokensBefore,
+        previousSummary,
+      } = preparation;
+
+      const allMessages = convertToLlm([...messagesToSummarize, ...turnPrefixMessages]);
+      if (allMessages.length === 0) {
+        ctx.ui.notify("🟠 pi-amber: nothing to summarize, using pi default", "warning");
+        return; // nothing to summarize → default behavior
+      }
+
+      const model = resolveSummaryModel(ctx, config);
+      if (!model) {
+        ctx.ui.notify("🟠 pi-amber: no model available (ctx.model undefined), using pi default", "warning");
+        return;
+      }
+
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+      if (!auth.ok) {
+        ctx.ui.notify(`🟠 pi-amber: auth failed (${auth.error}), using pi default`, "warning");
+        return;
+      }
+      const summaryAuth: SummaryAuth = {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        env: auth.env,
+      };
+
+      // Iterative context: reuse the previous summary (from the event or the branch).
+      const prevCompaction = lastCompactionFromBranch(branchEntries);
+      const previousSummarySource = previousSummary || prevCompaction?.summary;
+
+      // Escalation ladder: read the persisted pressure from the previous
+      // compaction, let it decay if stale, then decide how aggressive to be.
+      const prevDetails = prevCompaction?.details as AmberCompactionDetails | undefined;
+      const now = Date.now();
+      const pressure = normalizePressure(
+        prevDetails?.pressure ?? createCompactionPressure(),
+        now,
+      );
+      const escalate = pressure.level >= 1;
+
+      const summaryLanguage = detectSummaryLanguage(allMessages);
+
+      // --- UI: running phase ---
+      ctx.ui.setStatus(
+        STATUS_KEY,
+        `🟠 compacting ${allMessages.length} msgs · ${tokensBefore.toLocaleString()} tokens`,
+      );
+      ctx.ui.setWorkingMessage(
+        escalate ? `🟠 amber: compacting (level ${pressure.level})…` : "🟠 amber: compacting…",
+      );
+
       const result = await summarizeConversation({
         model,
         auth: summaryAuth,
@@ -215,12 +225,12 @@ export default function amber(pi: ExtensionAPI) {
         },
       };
     } catch (error) {
-      if (signal.aborted) throw error;
+      if (signal?.aborted) throw error;
       const message = error instanceof Error ? error.message : String(error);
       // --- UI: failed phase ---
       ctx.ui.setWorkingMessage();
       ctx.ui.setStatus(STATUS_KEY, `🟠 ✗ failed`);
-      ctx.ui.notify(`pi-amber: compaction failed (${message}), using default compaction`, "warning");
+      ctx.ui.notify(`🟠 pi-amber: handler error (${message}), using pi default`, "error");
       return; // fall back to pi's default compaction
     }
   });

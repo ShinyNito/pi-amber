@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
-import type { Message } from "@earendil-works/pi-ai";
+import type { Api, Message, Model } from "@earendil-works/pi-ai";
 import { estimateTextTokenUnits, estimateTextTokens } from "./tokenLedger.ts";
 import { detectSummaryLanguage } from "./summaryLanguage.ts";
 import {
@@ -13,6 +13,8 @@ import {
 import {
   serializeForSummary,
   estimateSummaryInputTokens,
+  summarizeConversation,
+  type CompleteFn,
   type SummarizeInput,
 } from "./summarizer.ts";
 import {
@@ -312,6 +314,84 @@ describe("summarizer", () => {
       fileOps: { read: new Set(), written: new Set(), edited: new Set() },
     });
     assert.doesNotMatch(text, /<read-files>/);
+  });
+
+  test("summarizeConversation pre-trims when payload exceeds context window", async () => {
+    // A tiny context window forces the pre-trim path: the first request must
+    // already be trimmed down (not the full 200-message payload).
+    const fakeModel = {
+      provider: "test",
+      id: "tiny",
+      api: {},
+      contextWindow: 2_000,
+      maxTokens: 1_024,
+    } as unknown as Model<Api>;
+    const input = { messages: makeMessages(200) };
+    const payloadTokens = estimateSummaryInputTokens(input);
+    assert.ok(payloadTokens > 2_000, "fixture must exceed the window");
+
+    const complete: CompleteFn = async (model, context, options) => {
+      // The serialized payload is embedded in the single user message.
+      const serialized = context.messages[0].content as string;
+      // Pre-trim keeps the tail (recent work), drops the head.
+      assert.ok(serialized.includes("user message 198"), "tail retained");
+      assert.ok(!serialized.includes("user message 0"), "head dropped");
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              "<summary>",
+              "<task>Handle the recent work.</task>",
+              "<constraints>",
+              "- keep it simple",
+              "</constraints>",
+              "<state>Tail messages retained.</state>",
+              "<artifacts>",
+              "- [file] /tmp/a.ts | created",
+              "</artifacts>",
+              "<decisions>",
+              "- proceed",
+              "</decisions>",
+              "<dead_ends>",
+              "- none",
+              "</dead_ends>",
+              "<knowledge>",
+              "- none",
+              "</knowledge>",
+              "<open_loops>",
+              "- none",
+              "</open_loops>",
+              "<next_steps>",
+              "- continue",
+              "</next_steps>",
+              "<breadcrumbs>",
+              "- /tmp",
+              "</breadcrumbs>",
+              "</summary>",
+            ].join("\n"),
+          },
+        ],
+        usage: {
+          input: 100,
+          output: 50,
+          totalTokens: 150,
+          cost: { input: 0, output: 0, total: 0 },
+        },
+      };
+    };
+
+    const result = await summarizeConversation({
+      model: fakeModel,
+      auth: {},
+      input,
+      maxTokens: 1_024,
+      recentSources: [],
+      complete,
+    });
+    assert.ok(result.summaryText.includes("Handle the recent work"));
+    // payloadTokens still reflects the FULL conversation (stats口径).
+    assert.equal(result.payloadTokens, payloadTokens);
   });
 });
 

@@ -261,9 +261,18 @@ export async function summarizeConversation(params: {
   const verificationSignals = buildVerificationSignals(params.recentSources);
   const payloadTokens = estimateSummaryInputTokens(params.input);
 
-  // Start from the full input, but when escalated, pre-trim to roughly half to
-  // avoid a guaranteed overflow on the first request.
-  let input = params.escalate ? (shrinkInput(params.input) ?? params.input) : params.input;
+  // Initial input selection: start from the full input, but pre-trim when the
+  // payload would overflow the model's context window, so we don't waste a
+  // full request round that is guaranteed to fail.
+  let input = params.input;
+  if (params.escalate) input = shrinkInput(input) ?? input;
+  const windowLimit = params.model.contextWindow;
+  if (Number.isFinite(windowLimit)) {
+    const safetyMargin = params.maxTokens + Math.max(4_000, Math.floor(windowLimit * 0.1));
+    if (payloadTokens > windowLimit - safetyMargin) {
+      input = shrinkInput(input) ?? input;
+    }
+  }
   let serialized = serializeForSummary(input);
   let networkRetryUsed = false;
 

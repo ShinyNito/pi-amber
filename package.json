@@ -1,6 +1,6 @@
 {
   "name": "@shinynito/pi-amber",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "pi extension: context compaction with structured summaries, validation, and self-repair",
   "type": "module",
   "keywords": [
