@@ -14,6 +14,7 @@ import {
   serializeForSummary,
   estimateSummaryInputTokens,
   summarizeConversation,
+  toSummaryAuth,
   type CompleteFn,
   type SummarizeInput,
 } from "./summarizer.ts";
@@ -392,6 +393,168 @@ describe("summarizer", () => {
     assert.ok(result.summaryText.includes("Handle the recent work"));
     // payloadTokens still reflects the FULL conversation (stats口径).
     assert.equal(result.payloadTokens, payloadTokens);
+  });
+
+  const validXmlFixture = `<summary>
+<task>Continue the refactor.</task>
+<state>Halfway done.</state>
+<artifacts>
+- [file] /tmp/a.ts | modified
+</artifacts>
+<next_steps>
+1. finish the refactor
+</next_steps>
+</summary>`;
+
+  test("empty output with stopReason length retries with doubled maxTokens", async () => {
+    const fakeModel = {
+      provider: "test",
+      id: "reasoner",
+      api: {},
+      contextWindow: 128_000,
+    } as unknown as Model<Api>;
+
+    const seenMaxTokens: number[] = [];
+    const complete: CompleteFn = async (_model, _context, options) => {
+      seenMaxTokens.push(options.maxTokens);
+      if (seenMaxTokens.length === 1) {
+        // Reasoning model burned the whole budget on thinking → empty text.
+        return { content: [{ type: "text", text: "" }], stopReason: "length" };
+      }
+      return { content: [{ type: "text", text: validXmlFixture }], stopReason: "stop" };
+    };
+
+    const result = await summarizeConversation({
+      model: fakeModel,
+      auth: {},
+      input: { messages: makeMessages(1) },
+      maxTokens: 1_024,
+      recentSources: [],
+      complete,
+    });
+    assert.deepEqual(seenMaxTokens, [1_024, 2_048]);
+    assert.ok(result.summaryText.includes("Continue the refactor"));
+  });
+
+  test("persistent empty output throws an actionable error", async () => {
+    const fakeModel = {
+      provider: "test",
+      id: "broken",
+      api: {},
+      contextWindow: 128_000,
+    } as unknown as Model<Api>;
+
+    const complete: CompleteFn = async () => ({
+      content: [{ type: "text", text: "   " }],
+      stopReason: "stop",
+    });
+
+    await assert.rejects(
+      () =>
+        summarizeConversation({
+          model: fakeModel,
+          auth: {},
+          input: { messages: makeMessages(1) },
+          maxTokens: 1_024,
+          recentSources: [],
+          complete,
+        }),
+      /empty output/,
+    );
+  });
+
+  test("toSummaryAuth promotes bearer header to apiKey", () => {
+    const result = toSummaryAuth({ headers: { Authorization: "Bearer jwt-token-123", "X-Other": "keep" } });
+    assert.equal(result.apiKey, "jwt-token-123");
+    assert.deepEqual(result.headers, { "X-Other": "keep" });
+  });
+
+  test("toSummaryAuth leaves explicit apiKey untouched", () => {
+    const result = toSummaryAuth({ apiKey: "direct-key", headers: { Authorization: "Bearer other" } });
+    assert.equal(result.apiKey, "direct-key");
+    assert.deepEqual(result.headers, { Authorization: "Bearer other" });
+  });
+
+  test("toSummaryAuth drops empty header map", () => {
+    const result = toSummaryAuth({ headers: { authorization: "bearer  spaced-token " } });
+    assert.equal(result.apiKey, "spaced-token");
+    assert.equal(result.headers, undefined);
+  });
+
+  test("provider error responses surface errorMessage and reject", async () => {
+    const fakeModel = {
+      provider: "test",
+      id: "erroneous",
+      api: {},
+      contextWindow: 128_000,
+    } as unknown as Model<Api>;
+
+    let calls = 0;
+    const complete: CompleteFn = async () => {
+      calls += 1;
+      return {
+        content: [],
+        stopReason: "error",
+        errorMessage: "rate limit exceeded, try again later",
+      };
+    };
+
+    await assert.rejects(
+      () =>
+        summarizeConversation({
+          model: fakeModel,
+          auth: {},
+          input: { messages: makeMessages(1) },
+          maxTokens: 1_024,
+          recentSources: [],
+          complete,
+        }),
+      /provider error: rate limit exceeded/,
+    );
+    // "rate limit" is non-retryable → no retry attempts.
+    assert.equal(calls, 1);
+  });
+
+  test("401 provider error refreshes auth and retries once", async () => {
+    const fakeModel = {
+      provider: "test",
+      id: "oauth-model",
+      api: {},
+      contextWindow: 128_000,
+    } as unknown as Model<Api>;
+
+    const seenApiKeys: (string | undefined)[] = [];
+    let calls = 0;
+    const complete: CompleteFn = async (_model, _context, options) => {
+      calls += 1;
+      seenApiKeys.push(options.apiKey);
+      if (calls === 1) {
+        return {
+          content: [],
+          stopReason: "error",
+          errorMessage: '401 {"error":{"type":"authentication_error","message":"The API Key appears to be invalid"}}',
+        };
+      }
+      return { content: [{ type: "text", text: validXmlFixture }], stopReason: "stop" };
+    };
+
+    let refreshes = 0;
+    const result = await summarizeConversation({
+      model: fakeModel,
+      auth: { apiKey: "stale-token" },
+      refreshAuth: async () => {
+        refreshes += 1;
+        return { apiKey: "fresh-token" };
+      },
+      input: { messages: makeMessages(1) },
+      maxTokens: 1_024,
+      recentSources: [],
+      complete,
+    });
+    assert.equal(refreshes, 1);
+    assert.equal(calls, 2);
+    assert.deepEqual(seenApiKeys, ["stale-token", "fresh-token"]);
+    assert.ok(result.summaryText.includes("Continue the refactor"));
   });
 });
 

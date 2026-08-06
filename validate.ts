@@ -186,7 +186,14 @@ export function validateCompactionSummary(
   }
 
   if (errors.length > 0) {
-    throw new Error(`Compaction summary validation failed: ${errors.join(", ")}`);
+    // Attach a snippet of the model's raw output so the failure is diagnosable
+    // from the notification alone (e.g. empty output, prose instead of XML).
+    const compact = raw.trim().replace(/\s+/g, " ");
+    const excerpt = compact.length > 160 ? `${compact.slice(0, 160)}…` : compact;
+    const evidence = excerpt
+      ? ` | model output began: ${JSON.stringify(excerpt)}`
+      : " | model output was empty";
+    throw new Error(`Compaction summary validation failed: ${errors.join(", ")}${evidence}`);
   }
 
   return formatSummaryForContext(parsed);

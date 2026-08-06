@@ -22,6 +22,38 @@ export type SummaryAuth = {
   env?: Record<string, string>;
 };
 
+/**
+ * Normalize resolved registry auth for the summarizer request.
+ *
+ * OAuth resolutions carry the credential only as an `Authorization: Bearer`
+ * header. With `apiKey` unset, the Anthropic SDK silently falls back to
+ * `process.env.ANTHROPIC_API_KEY` and injects that (possibly stale) key as
+ * `x-api-key` — gateways then reject the request despite the valid Bearer
+ * token (observed with kimi-coding: 401 with both headers on the wire).
+ * Promoting the bearer token to `apiKey` prevents the env fallback:
+ * `sk-ant-oat` tokens still take pi-ai's OAuth path; other tokens are sent
+ * as `x-api-key`, which Kimi accepts.
+ */
+export function toSummaryAuth(auth: SummaryAuth): SummaryAuth {
+  const headers = { ...(auth.headers ?? {}) };
+  let apiKey = auth.apiKey;
+  if (!apiKey) {
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase() !== "authorization") continue;
+      const match = headers[name]?.match(/^Bearer\s+(.+)$/i);
+      if (match) {
+        apiKey = match[1].trim();
+        delete headers[name];
+      }
+    }
+  }
+  return {
+    apiKey,
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
+    env: auth.env,
+  };
+}
+
 export type CompleteFn = (
   model: Model<Api>,
   context: Context,
@@ -39,6 +71,9 @@ export type CompleteFn = (
   usage?: Usage;
   responseId?: string;
   timestamp?: number;
+  stopReason?: string;
+  /** Provider error detail when stopReason is "error". */
+  errorMessage?: string;
 }>;
 
 const defaultComplete: CompleteFn = async (model, context, options) => {
@@ -56,6 +91,8 @@ const defaultComplete: CompleteFn = async (model, context, options) => {
     usage: response.usage,
     responseId: response.responseId,
     timestamp: response.timestamp,
+    stopReason: response.stopReason,
+    errorMessage: response.errorMessage,
   };
 };
 
@@ -103,6 +140,14 @@ function isTransientError(error: unknown) {
   if (isNonRetryableError(error)) return false;
   const message = error instanceof Error ? error.message : String(error);
   return /timeout|timed out|network|socket|econn|5\d\d|temporar/i.test(message);
+}
+
+/** OAuth tokens rotate on a ~15-minute TTL; a token fetched up-front can be
+ * invalidated mid-flight (another request refreshes first). Re-fetching the
+ * credential reads the latest on-disk state, so one retry fixes it. */
+function isAuthError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b401\b|unauthorized|authentication|invalid api key|expired/i.test(message);
 }
 
 export type SummarizeInput = {
@@ -241,13 +286,18 @@ async function requestSummary(params: SummarizerRequest): Promise<Awaited<Return
 }
 
 /**
- * Summary request with a recovery pipeline: overflow → shrink input and retry
- * (once); transient error → backoff retry (once); validation failure → feed the
- * invalid output back for one self-repair. All attempts check abort.
+ * Summary request with a recovery pipeline: auth error → re-fetch credentials
+ * and retry (once); overflow → shrink input and retry (once); transient error
+ * → backoff retry (once); empty output → retry with doubled maxTokens when the
+ * budget was provably exhausted (stopReason "length"), else one backoff retry;
+ * validation failure → feed the invalid output back for one self-repair.
+ * All attempts check abort.
  */
 export async function summarizeConversation(params: {
   model: Model<Api>;
   auth: SummaryAuth;
+  /** Re-fetch credentials (OAuth access tokens rotate on short TTLs). */
+  refreshAuth?: () => Promise<SummaryAuth>;
   input: SummarizeInput;
   maxTokens: number;
   signal?: AbortSignal;
@@ -274,7 +324,12 @@ export async function summarizeConversation(params: {
     }
   }
   let serialized = serializeForSummary(input);
+  let maxTokens = params.maxTokens;
+  let auth = params.auth;
+  let authRefreshUsed = false;
   let networkRetryUsed = false;
+  let emptyRetryUsed = false;
+  let budgetBumped = false;
 
   const tryShrink = (): boolean => {
     const shrunk = shrinkInput(input);
@@ -291,15 +346,29 @@ export async function summarizeConversation(params: {
     try {
       response = await requestSummary({
         model: params.model,
-        auth: params.auth,
+        auth,
         serialized,
-        maxTokens: params.maxTokens,
+        maxTokens,
         signal: params.signal,
         complete,
         summaryLanguage: params.summaryLanguage,
       });
+      // Some providers (e.g. Kimi) return HTTP-200 responses whose final
+      // message carries stopReason "error" instead of throwing. Surface the
+      // provider's message so it flows through the same recovery
+      // classification (overflow → shrink, transient → retry) as real throws.
+      if (response.stopReason === "error") {
+        throw new Error(
+          `summarizer provider error: ${response.errorMessage ?? "unknown provider error"}`,
+        );
+      }
     } catch (error) {
       if (params.signal?.aborted) throw error;
+      if (!authRefreshUsed && params.refreshAuth && isAuthError(error)) {
+        authRefreshUsed = true;
+        auth = await params.refreshAuth();
+        continue;
+      }
       if (isOverflowError(error) && tryShrink()) continue;
       if (!networkRetryUsed && isTransientError(error)) {
         networkRetryUsed = true;
@@ -310,6 +379,34 @@ export async function summarizeConversation(params: {
     }
 
     const text = extractText(response);
+
+    if (!text.trim()) {
+      // Empty output. stopReason "length" proves the token budget was
+      // exhausted — reasoning models can spend all of maxTokens on thinking —
+      // so retry once with doubled headroom (quality-preserving: we do NOT
+      // lower the thinking level). Other empty responses are treated as
+      // transient and retried once with backoff.
+      if (response.stopReason === "length" && !budgetBumped && maxTokens < 32_768) {
+        budgetBumped = true;
+        maxTokens = Math.min(maxTokens * 2, 32_768);
+        continue;
+      }
+      if (!emptyRetryUsed) {
+        emptyRetryUsed = true;
+        await sleepWithAbort(getRetryDelayMs(0), params.signal);
+        continue;
+      }
+      const stats = [
+        `stopReason=${response.stopReason ?? "unknown"}`,
+        `outputTokens=${response.usage?.output ?? "?"}`,
+        `reasoningTokens=${(response.usage as { reasoning?: number } | undefined)?.reasoning ?? "?"}`,
+      ].join(", ");
+      const hint =
+        response.stopReason === "length"
+          ? "output hit the maxTokens cap; raise maxTokens in ~/.pi/pi-amber.json"
+          : "the provider returned no text; consider setting a different summarizer model in ~/.pi/pi-amber.json";
+      throw new Error(`summarizer returned empty output (${stats}; ${hint})`);
+    }
 
     const finalize = (rawText: string): SummarizeResult => {
       const summaryText = validateCompactionSummary(
@@ -334,9 +431,9 @@ export async function summarizeConversation(params: {
       try {
         const repaired = await requestSummary({
           model: params.model,
-          auth: params.auth,
+          auth,
           serialized,
-          maxTokens: params.maxTokens,
+          maxTokens,
           signal: params.signal,
           complete,
           summaryLanguage: params.summaryLanguage,

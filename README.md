@@ -8,12 +8,13 @@ When your conversation grows too long, pi compacts it into a summary. `pi-amber`
 
 - **Structured XML checkpoints** — dense handoff documents with `task / constraints / state / artifacts / decisions / dead_ends / knowledge / open_loops / next_steps / breadcrumbs`
 - **Anti-hallucination validation** — summaries must keep required sections and at least one recent technical reference (paths/commands) verbatim; failures trigger an automatic self-repair pass
-- **Self-repair pipeline** — overflow → shrink input and retry; transient errors → backoff retry; validation failure → feed the invalid output back for one repair
+- **Self-repair pipeline** — auth errors → re-fetch OAuth credentials and retry (tokens rotate on short TTLs); overflow → shrink input and retry; transient errors → backoff retry; empty output (exhausted budget) → double maxTokens once; validation failure → feed the invalid output back for one repair
 - **Language-aware summaries** — detects CJK-dominant conversations (Chinese / Japanese / Korean) and writes the summary in the user's language
 - **Pressure escalation ladder** — consecutive ineffective compactions raise the trim aggressiveness (persisted across compactions), decaying after 5 idle minutes
 - **Deterministic file ledger** — pi's extracted `read/written/edited` file operations are injected into the summarizer context, so artifacts never rely on the model's memory alone
 - **Iterative context** — the previous summary is passed to the next compaction
 - **Uses pi's own machinery** — `convertToLlm`, `serializeConversation`, `estimateTokens`, model registry auth — no re-implemented infrastructure
+- **Themed footer status** — subtle idle badge, animated spinner with live message/token counts during compaction, and a persistent `before → after` checkpoint result; notifications stay plain and emoji-free
 
 ## Install
 
@@ -44,6 +45,8 @@ Optional config at `~/.pi/pi-amber.json`:
 | `model` | `""` (current session model) | Provider/model used for summarization, e.g. `"google/gemini-2.5-flash"`. Empty uses the active session model. |
 | `maxTokens` | `8192` | Max output tokens for the summary request. |
 | `enabled` | `true` | Set `false` to fall back to pi's default compaction entirely. |
+
+When compaction fails, pi-amber falls back to pi's default and appends a diagnostics line (model, message count, stopReason, token usage, validation excerpt) to `~/.pi/pi-amber-debug.jsonl` — check that file first when reporting issues.
 
 ## How it works
 
@@ -93,6 +96,7 @@ pnpm test             # node --experimental-strip-types --test tests.test.ts
 
 ```
 index.ts           # extension entry: before_agent_start + session_before_compact + session_compact
+ui.ts              # themed footer status: idle badge, animated compaction spinner, checkpoint result
 policy.ts          # summarizer system prompt (XML schema + security + language rule)
 summarizer.ts      # request pipeline: serialize → recover (shrink/retry/repair)
 validate.ts        # XML parsing + structural/technical-ref validation

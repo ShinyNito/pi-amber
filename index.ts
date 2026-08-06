@@ -1,4 +1,7 @@
 import type { Message, Usage } from "@earendil-works/pi-ai";
+import { appendFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   convertToLlm,
   type CompactionEntry,
@@ -7,7 +10,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig, type AmberConfig } from "./config.ts";
-import { type SummaryAuth, summarizeConversation } from "./summarizer.ts";
+import { type SummaryAuth, summarizeConversation, toSummaryAuth } from "./summarizer.ts";
 import { detectSummaryLanguage } from "./summaryLanguage.ts";
 import { type VerificationSource } from "./validate.ts";
 import { SUMMARY_PROMPT_VERSION } from "./policy.ts";
@@ -17,6 +20,7 @@ import {
   notePressureAfterCompaction,
   type CompactionPressure,
 } from "./pressure.ts";
+import { AmberStatus, formatCompact } from "./ui.ts";
 
 export type AmberCompactionDetails = {
   version: string;
@@ -34,10 +38,20 @@ export type AmberCompactionDetails = {
 
 // --- helpers ----------------------------------------------------------------
 
-const STATUS_KEY = "amber";
-
 function lastCompactionFromBranch(entries: readonly SessionEntry[]): CompactionEntry | undefined {
   return entries.findLast((entry) => entry.type === "compaction") as CompactionEntry | undefined;
+}
+
+/** Best-effort failure diagnostics: one JSON line per failure, never throws. */
+function debugLogFailure(record: Record<string, unknown>): void {
+  try {
+    appendFileSync(
+      join(homedir(), ".pi", "pi-amber-debug.jsonl"),
+      JSON.stringify({ at: new Date().toISOString(), ...record }) + "\n",
+    );
+  } catch {
+    // diagnostics must never break compaction
+  }
 }
 
 function toVerificationSources(messages: readonly Message[]): VerificationSource[] {
@@ -100,8 +114,16 @@ export default function amber(pi: ExtensionAPI) {
   // (the session_before_compact event does not carry it).
   let cachedSystemPrompt = "";
 
-  pi.on("session_start", (event, ctx) => {
-    ctx.ui.notify("🟠 pi-amber loaded — ready to compact", "info");
+  // Shared across events: the footer spinner started in session_before_compact
+  // is stopped in session_compact, so the instance must outlive one handler.
+  let status: AmberStatus | undefined;
+  const statusFor = (ctx: ExtensionContext): AmberStatus => {
+    status ??= new AmberStatus(ctx.ui);
+    return status;
+  };
+
+  pi.on("session_start", (_event, ctx) => {
+    statusFor(ctx).idle();
   });
 
   pi.on("before_agent_start", (event) => {
@@ -112,10 +134,11 @@ export default function amber(pi: ExtensionAPI) {
     // The entire handler is guarded: any unexpected error falls back to pi's
     // default compaction with a visible notice instead of silently dying.
     const { preparation, branchEntries, signal } = event;
+    let diagnostics: Record<string, unknown> = {};
     try {
       const config = loadConfig();
       if (!config.enabled) {
-        ctx.ui.notify("🟠 pi-amber: disabled in config, using pi default", "warning");
+        ctx.ui.notify("amber: disabled in config, using pi default compaction", "warning");
         return;
       }
 
@@ -129,25 +152,31 @@ export default function amber(pi: ExtensionAPI) {
 
       const allMessages = convertToLlm([...messagesToSummarize, ...turnPrefixMessages]);
       if (allMessages.length === 0) {
-        ctx.ui.notify("🟠 pi-amber: nothing to summarize, using pi default", "warning");
+        ctx.ui.notify("amber: nothing to summarize, using pi default", "warning");
         return; // nothing to summarize → default behavior
       }
 
       const model = resolveSummaryModel(ctx, config);
       if (!model) {
-        ctx.ui.notify("🟠 pi-amber: no model available (ctx.model undefined), using pi default", "warning");
+        ctx.ui.notify("amber: no model available (ctx.model undefined), using pi default", "warning");
         return;
       }
 
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
       if (!auth.ok) {
-        ctx.ui.notify(`🟠 pi-amber: auth failed (${auth.error}), using pi default`, "warning");
+        ctx.ui.notify(`amber: auth failed (${auth.error}), using pi default`, "warning");
         return;
       }
-      const summaryAuth: SummaryAuth = {
-        apiKey: auth.apiKey,
-        headers: auth.headers,
-        env: auth.env,
+      const summaryAuth: SummaryAuth = toSummaryAuth(auth);
+      // OAuth access tokens rotate on short TTLs (Kimi: ~15 min); a token can
+      // be invalidated mid-request when another refresh wins the race. Re-read
+      // the registry to pick up the latest credential on auth failures.
+      const refreshAuth = async (): Promise<SummaryAuth> => {
+        const refreshed = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+        if (!refreshed.ok) {
+          throw new Error(`auth refresh failed: ${refreshed.error}`);
+        }
+        return toSummaryAuth(refreshed);
       };
 
       // Iterative context: reuse the previous summary (from the event or the branch).
@@ -166,18 +195,24 @@ export default function amber(pi: ExtensionAPI) {
 
       const summaryLanguage = detectSummaryLanguage(allMessages);
 
-      // --- UI: running phase ---
-      ctx.ui.setStatus(
-        STATUS_KEY,
-        `🟠 compacting ${allMessages.length} msgs · ${tokensBefore.toLocaleString()} tokens`,
-      );
-      ctx.ui.setWorkingMessage(
-        escalate ? `🟠 amber: compacting (level ${pressure.level})…` : "🟠 amber: compacting…",
-      );
+      diagnostics = {
+        model: `${model.provider}/${model.id}`,
+        messages: allMessages.length,
+        tokensBefore,
+        summaryLanguage,
+      };
+
+      // --- UI: running phase (footer spinner; pi's own loader covers the chat area) ---
+      statusFor(ctx).startCompaction({
+        messages: allMessages.length,
+        tokens: tokensBefore,
+        level: pressure.level,
+      });
 
       const result = await summarizeConversation({
         model,
         auth: summaryAuth,
+        refreshAuth,
         input: {
           messages: allMessages,
           previousSummary: previousSummarySource,
@@ -208,13 +243,6 @@ export default function amber(pi: ExtensionAPI) {
         pressure: nextPressure,
       };
 
-      // --- UI: done phase ---
-      ctx.ui.setWorkingMessage();
-      ctx.ui.setStatus(
-        STATUS_KEY,
-        `🟠 ✓ ${result.summaryChars.toLocaleString()} chars → ${effective ? "compact" : "still large"}`,
-      );
-
       return {
         compaction: {
           summary: result.summaryText,
@@ -225,27 +253,42 @@ export default function amber(pi: ExtensionAPI) {
         },
       };
     } catch (error) {
-      if (signal?.aborted) throw error;
+      if (signal?.aborted) {
+        statusFor(ctx).idle();
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
+      debugLogFailure({ ...diagnostics, error: message });
       // --- UI: failed phase ---
-      ctx.ui.setWorkingMessage();
-      ctx.ui.setStatus(STATUS_KEY, `🟠 ✗ failed`);
-      ctx.ui.notify(`🟠 pi-amber: handler error (${message}), using pi default`, "error");
+      statusFor(ctx).failed();
+      ctx.ui.notify(`amber: compaction failed (${message}), using pi default`, "error");
       return; // fall back to pi's default compaction
     }
   });
 
   pi.on("session_compact", async (event, ctx) => {
-    // Restore the default working indicator and clear the status.
-    ctx.ui.setWorkingMessage();
-    ctx.ui.setStatus(STATUS_KEY, undefined);
-    if (!event.fromExtension) return;
-    const details = (event.compactionEntry as CompactionEntry<AmberCompactionDetails>).details;
-    if (details) {
-      ctx.ui.notify(
-        `🟠 amber: context checkpointed · ${details.summaryChars.toLocaleString()} chars · ${details.payloadTokens.toLocaleString()} payload tokens`,
-        "info",
-      );
+    if (!event.fromExtension) {
+      // pi's own compaction ran (fallback or amber disabled) → back to idle.
+      statusFor(ctx).idle();
+      return;
     }
+    const details = (event.compactionEntry as CompactionEntry<AmberCompactionDetails>).details;
+    if (!details) {
+      statusFor(ctx).idle();
+      return;
+    }
+    statusFor(ctx).done({
+      payloadTokens: details.payloadTokens,
+      tokensBefore: details.tokensBefore,
+      effective: details.effective ?? true,
+    });
+    const effective = details.effective !== false;
+    const trend = effective
+      ? `${formatCompact(details.tokensBefore)} → ${formatCompact(details.payloadTokens)} tok`
+      : `${formatCompact(details.payloadTokens)} tok · still large`;
+    ctx.ui.notify(
+      `amber: checkpoint · ${formatCompact(details.summaryChars)} chars · ${trend}`,
+      effective ? "info" : "warning",
+    );
   });
 }
